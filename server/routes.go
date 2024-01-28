@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"log"
 	"log/slog"
+	"math/rand"
 	"net"
 	"net/http"
 	"os"
@@ -26,6 +28,7 @@ import (
 	"github.com/jmorganca/ollama/api"
 	"github.com/jmorganca/ollama/gpu"
 	"github.com/jmorganca/ollama/llm"
+	"github.com/jmorganca/ollama/openai"
 	"github.com/jmorganca/ollama/parser"
 	"github.com/jmorganca/ollama/version"
 )
@@ -63,9 +66,7 @@ var loaded struct {
 var defaultSessionDuration = 5 * time.Minute
 
 // load a model into memory if it is not already loaded, it is up to the caller to lock loaded.mu before calling this function
-func load(c *gin.Context, model *Model, opts api.Options, sessionDuration time.Duration) error {
-	workDir := c.GetString("workDir")
-
+func load(model *Model, opts api.Options, sessionDuration time.Duration) error {
 	needLoad := loaded.runner == nil || // is there a model loaded?
 		loaded.ModelPath != model.ModelPath || // has the base model changed?
 		!reflect.DeepEqual(loaded.AdapterPaths, model.AdapterPaths) || // have the adapters changed?
@@ -80,7 +81,7 @@ func load(c *gin.Context, model *Model, opts api.Options, sessionDuration time.D
 			loaded.Options = nil
 		}
 
-		llmRunner, err := llm.New(workDir, model.ModelPath, model.AdapterPaths, model.ProjectorPaths, opts)
+		llmRunner, err := llm.New(model.ModelPath, model.AdapterPaths, model.ProjectorPaths, opts)
 		if err != nil {
 			// some older models are not compatible with newer versions of llama.cpp
 			// show a generalized compatibility error until there is a better way to
@@ -193,7 +194,7 @@ func GenerateHandler(c *gin.Context) {
 		sessionDuration = req.KeepAlive.Duration
 	}
 
-	if err := load(c, model, opts, sessionDuration); err != nil {
+	if err := load(model, opts, sessionDuration); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
@@ -399,7 +400,7 @@ func EmbeddingHandler(c *gin.Context) {
 		sessionDuration = req.KeepAlive.Duration
 	}
 
-	if err := load(c, model, opts, sessionDuration); err != nil {
+	if err := load(model, opts, sessionDuration); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
@@ -923,6 +924,9 @@ func (s *Server) GenerateRoutes() http.Handler {
 	r.POST("/api/blobs/:digest", CreateBlobHandler)
 	r.HEAD("/api/blobs/:digest", HeadBlobHandler)
 
+	// Experimental compatibility endpoints
+	r.POST("/v1/chat/completions", ChatCompletionsHandler)
+
 	for _, method := range []string{http.MethodGet, http.MethodHead} {
 		r.Handle(method, "/", func(c *gin.Context) {
 			c.String(http.StatusOK, "Ollama is running")
@@ -1048,83 +1052,115 @@ func streamResponse(c *gin.Context, ch chan any) {
 }
 
 func ChatHandler(c *gin.Context) {
+	var req api.ChatRequest
+	err := c.ShouldBindJSON(&req)
+	if err != nil {
+		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	ch, err := chat(c.Request.Context(), req)
+	if err != nil {
+		var se api.StatusError
+		switch {
+		case errors.As(err, &se):
+			c.AbortWithStatusJSON(se.StatusCode, se)
+		default:
+			c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		}
+	}
+
+	stream := req.Stream == nil || *req.Stream && len(req.Messages) > 0
+	if stream {
+		streamResponse(c, ch)
+		return
+	}
+
+	var content string
+	var res api.ChatResponse
+	for r := range ch {
+		switch r := r.(type) {
+		case api.ChatResponse:
+			content += r.Message.Content
+			res = r
+		case api.StatusError:
+			c.AbortWithStatusJSON(r.StatusCode, r)
+			return
+		}
+	}
+	res.Message.Content = content
+	c.JSON(http.StatusOK, res)
+}
+
+func chat(ctx context.Context, req api.ChatRequest) (chan any, error) {
 	loaded.mu.Lock()
 	defer loaded.mu.Unlock()
 
 	checkpointStart := time.Now()
 
-	var req api.ChatRequest
-	err := c.ShouldBindJSON(&req)
-	switch {
-	case errors.Is(err, io.EOF):
-		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "missing request body"})
-		return
-	case err != nil:
-		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
+	if req.Model == "" {
+		return nil, api.StatusError{
+			StatusCode:   http.StatusBadRequest,
+			ErrorMessage: "model is required",
+		}
 	}
 
-	// validate the request
-	switch {
-	case req.Model == "":
-		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "model is required"})
-		return
-	case len(req.Format) > 0 && req.Format != "json":
-		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "format must be json"})
-		return
+	if len(req.Format) > 0 && req.Format != "json" {
+		return nil, api.StatusError{
+			StatusCode:   http.StatusBadRequest,
+			ErrorMessage: "format must be json",
+		}
 	}
 
 	model, err := GetModel(req.Model)
 	if err != nil {
 		var pErr *fs.PathError
 		if errors.As(err, &pErr) {
-			c.JSON(http.StatusNotFound, gin.H{"error": fmt.Sprintf("model '%s' not found, try pulling it first", req.Model)})
-			return
+			return nil, api.StatusError{
+				StatusCode:   http.StatusNotFound,
+				ErrorMessage: fmt.Sprintf("model '%s' not found, try pulling it first", req.Model),
+			}
 		}
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
+		return nil, api.StatusError{
+			StatusCode:   http.StatusInternalServerError,
+			ErrorMessage: err.Error(),
+		}
 	}
 
 	opts, err := modelOptions(model, req.Options)
 	if err != nil {
 		if errors.Is(err, api.ErrInvalidOpts) {
-			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-			return
+			return nil, api.StatusError{
+				StatusCode:   http.StatusBadRequest,
+				ErrorMessage: err.Error(),
+			}
 		}
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
+		return nil, api.StatusError{
+			StatusCode:   http.StatusInternalServerError,
+			ErrorMessage: err.Error(),
+		}
 	}
 
-	var sessionDuration time.Duration
-	if req.KeepAlive == nil {
-		sessionDuration = defaultSessionDuration
-	} else {
+	sessionDuration := defaultSessionDuration
+	if req.KeepAlive != nil {
 		sessionDuration = req.KeepAlive.Duration
 	}
 
-	if err := load(c, model, opts, sessionDuration); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-
-	// an empty request loads the model
-	if len(req.Messages) == 0 {
-		resp := api.ChatResponse{
-			CreatedAt: time.Now().UTC(),
-			Model:     req.Model,
-			Done:      true,
-			Message:   api.Message{Role: "assistant"},
+	if err := load(model, opts, sessionDuration); err != nil {
+		return nil, api.StatusError{
+			StatusCode:   http.StatusInternalServerError,
+			ErrorMessage: err.Error(),
 		}
-		c.JSON(http.StatusOK, resp)
-		return
 	}
 
 	checkpointLoaded := time.Now()
 
 	prompt, images, err := model.ChatPrompt(req.Messages)
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
+		return nil, api.StatusError{
+			StatusCode:   http.StatusBadRequest,
+			ErrorMessage: err.Error(),
+		}
 	}
 
 	slog.Debug(fmt.Sprintf("prompt: %s", prompt))
@@ -1132,10 +1168,19 @@ func ChatHandler(c *gin.Context) {
 	ch := make(chan any)
 
 	go func() {
-		defer close(ch)
+		// an empty request loads the model
+		if len(req.Messages) == 0 {
+			resp := api.ChatResponse{
+				CreatedAt: time.Now().UTC(),
+				Model:     req.Model,
+				Done:      true,
+				Message:   api.Message{Role: "assistant"},
+			}
+			ch <- resp
+			return
+		}
 
 		fn := func(r llm.PredictResult) {
-			// Update model expiration
 			loaded.expireAt = time.Now().Add(sessionDuration)
 			loaded.expireTimer.Reset(sessionDuration)
 
@@ -1160,45 +1205,184 @@ func ChatHandler(c *gin.Context) {
 			ch <- resp
 		}
 
-		// Start prediction
 		predictReq := llm.PredictOpts{
 			Prompt:  prompt,
 			Format:  req.Format,
 			Images:  images,
 			Options: opts,
 		}
-		if err := loaded.runner.Predict(c.Request.Context(), predictReq, fn); err != nil {
-			ch <- gin.H{"error": err.Error()}
-		}
-	}()
 
-	if req.Stream != nil && !*req.Stream {
-		// Accumulate responses into the final response
-		var final api.ChatResponse
-		var sb strings.Builder
-		for resp := range ch {
-			switch r := resp.(type) {
-			case api.ChatResponse:
-				sb.WriteString(r.Message.Content)
-				final = r
-			case gin.H:
-				if errorMsg, ok := r["error"].(string); ok {
-					c.JSON(http.StatusInternalServerError, gin.H{"error": errorMsg})
-					return
-				} else {
-					c.JSON(http.StatusInternalServerError, gin.H{"error": "unexpected error format in response"})
-					return
-				}
-			default:
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "unexpected error"})
-				return
+		err := loaded.runner.Predict(ctx, predictReq, fn)
+		if err != nil {
+			// TODO: return this error outside of the goroutine
+			ch <- api.StatusError{
+				StatusCode:   http.StatusInternalServerError,
+				ErrorMessage: err.Error(),
 			}
 		}
 
-		final.Message = api.Message{Role: "assistant", Content: sb.String()}
-		c.JSON(http.StatusOK, final)
+		close(ch)
+	}()
+
+	return ch, nil
+}
+
+func ChatCompletionsHandler(c *gin.Context) {
+	var req openai.Request
+	err := c.ShouldBindJSON(&req)
+	if err != nil {
+		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 
-	streamResponse(c, ch)
+	var messages []api.Message
+	for _, msg := range req.Messages {
+		messages = append(messages, api.Message{Role: msg.Role, Content: msg.Content})
+	}
+
+	options := make(map[string]interface{})
+	if req.Seed != nil {
+		options["seed"] = req.Seed
+	}
+
+	switch s := req.Stop.(type) {
+	case string:
+		options["stop"] = []string{s}
+	case []string:
+		options["stop"] = s
+	}
+
+	if req.MaxTokens != nil {
+		options["num_predict"] = *req.MaxTokens
+	}
+
+	if req.Temperature != nil {
+		options["temperature"] = *req.Temperature
+	}
+
+	if req.FrequencyPenalty != nil {
+		options["frequency_penalty"] = (*req.FrequencyPenalty + 2.0) / 4.0
+	}
+
+	if req.PresencePenalty != nil {
+		options["presence_penalty"] = (*req.PresencePenalty + 2.0) / 4.0
+	}
+
+	if req.TopP != nil {
+		options["top_p"] = *req.TopP
+	}
+
+	var format string
+	if req.ResponseFormat != nil && req.ResponseFormat.Type == "json_object" {
+		format = "json"
+	}
+
+	ch, err := chat(c.Request.Context(), api.ChatRequest{
+		Model:    req.Model,
+		Messages: messages,
+		Format:   format,
+		Options:  options,
+	})
+	if err != nil {
+		var se api.StatusError
+		switch {
+		case errors.As(err, &se):
+			c.AbortWithStatusJSON(se.StatusCode, se)
+		default:
+			c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		}
+
+		return
+	}
+
+	if req.Stream {
+		streamEvents(c, ch)
+		return
+	}
+
+	id := fmt.Sprintf("chatcmpl-%d", rand.Intn(999))
+	var content string
+	var res api.ChatResponse
+	for r := range ch {
+		switch r := r.(type) {
+		case api.ChatResponse:
+			content += r.Message.Content
+			res = r
+		case api.StatusError:
+			c.AbortWithStatusJSON(r.StatusCode, r)
+			return
+		}
+	}
+
+	res.Message.Content = content
+	c.JSON(http.StatusOK, &openai.Response{
+		Id:                id,
+		Object:            "chat.completion",
+		Created:           res.CreatedAt.Unix(),
+		Model:             req.Model,
+		SystemFingerprint: "fp_ollama",
+		Choices: []openai.Choice{{
+			Index:   0,
+			Message: openai.Message{Role: res.Message.Role, Content: res.Message.Content},
+			FinishReason: func(done bool) *string {
+				if done {
+					reason := "stop"
+					return &reason
+				}
+				return nil
+			}(res.Done),
+		}},
+		Usage: openai.Usage{
+			// TODO: ollama returns 0 for prompt eval if the prompt was cached, but openai returns the actual count
+			PromptTokens:     res.PromptEvalCount,
+			CompletionTokens: res.EvalCount,
+			TotalTokens:      res.PromptEvalCount + res.EvalCount,
+		},
+	})
+}
+
+func streamEvents(c *gin.Context, ch chan any) {
+	id := fmt.Sprintf("chatcmpl-%d", rand.Intn(999))
+	c.Header("Content-Type", "text/event-stream")
+	c.Stream(func(w io.Writer) bool {
+		r, ok := <-ch
+		if !ok {
+			// send "data: [DONE]" as last event
+			if _, err := w.Write([]byte("data: [DONE]")); err != nil {
+				log.Printf("streamEvents: write failed: %s", err)
+			}
+			return false
+		}
+
+		var chunk openai.Chunk
+		switch r := r.(type) {
+		case api.ChatResponse:
+			chunk = openai.Chunk{
+				Id:                id,
+				Object:            "chat.completion.chunk",
+				Created:           time.Now().Unix(),
+				Model:             r.Model,
+				SystemFingerprint: "fp_ollama",
+				Choices: []openai.ChunkChoice{
+					{
+						Index: 0,
+						Delta: openai.Message{Role: "assistant", Content: r.Message.Content},
+					},
+				},
+			}
+		}
+
+		bts, err := json.Marshal(chunk)
+		if err != nil {
+			log.Printf("streamEvents: marshal failed: %s", err)
+			return false
+		}
+
+		if _, err := w.Write([]byte(fmt.Sprintf("data: %s\n\n", bts))); err != nil {
+			log.Printf("streamEvents: write failed %s", err)
+			return false
+		}
+
+		return true
+	})
 }

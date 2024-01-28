@@ -19,7 +19,7 @@ type LLM interface {
 	Close()
 }
 
-func New(workDir, model string, adapters, projectors []string, opts api.Options) (LLM, error) {
+func New(model string, adapters, projectors []string, opts api.Options) (LLM, error) {
 	if _, err := os.Stat(model); err != nil {
 		return nil, err
 	}
